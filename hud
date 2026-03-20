@@ -1,0 +1,868 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["rich", "requests"]
+# ///
+"""
+hud - Heads-Up Display for your workday.
+
+Run:   uv run ~/files/scripts/hud
+Setup: uv run ~/files/scripts/hud --setup
+
+Config/cache/themes stored in ~/.config/hud/
+"""
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.cells import set_cell_size
+from rich.text import Text
+
+# ── Directory Layout ──────────────────────────────────────────────────────────
+#   ~/.config/hud/
+#   ├── config.json
+#   ├── cache.json
+#   └── themes/
+#       └── (custom theme files)
+
+BASE_DIR = Path.home() / ".config" / "hud"
+CONFIG_FILE = BASE_DIR / "config.json"
+CACHE_FILE = BASE_DIR / "cache.json"
+THEMES_DIR = BASE_DIR / "themes"
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+DEFAULT_CONFIG = {
+    "github_token": "",
+    "github_user": "",
+    "github_repos": ["apache/trafficserver"],
+    "jira_email": "",
+    "jira_pat_path": "~/.ssh/jira.pat",
+    "jira_base_url": "https://ouryahoo.atlassian.net",
+    "jira_project": "YTSATS",
+    "weather_zip": "95123",
+    "theme": "yahoo",
+}
+
+
+def load_config() -> dict:
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE) as f:
+            return {**DEFAULT_CONFIG, **json.load(f)}
+    return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg: dict):
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def run_setup():
+    cfg = load_config()
+    print("hud setup\n")
+    print("  GitHub token: https://github.com/settings/tokens")
+    print("  Create a token with 'repo' scope (classic) or 'Issues: read' + 'Pull requests: read' (fine-grained)\n")
+
+    cfg["github_token"] = input(f"  GitHub token [{cfg['github_token'][:8] + '...' if cfg['github_token'] else ''}]: ").strip() or cfg["github_token"]
+    cfg["github_user"] = input(f"  GitHub username [{cfg['github_user']}]: ").strip() or cfg["github_user"]
+
+    repos_input = input(f"  GitHub repos (comma-separated) [{','.join(cfg['github_repos'])}]: ").strip()
+    if repos_input:
+        cfg["github_repos"] = [r.strip() for r in repos_input.split(",")]
+
+    cfg["jira_email"] = input(f"  Jira email [{cfg['jira_email']}]: ").strip() or cfg["jira_email"]
+    cfg["jira_pat_path"] = input(f"  Jira PAT path [{cfg['jira_pat_path']}]: ").strip() or cfg["jira_pat_path"]
+    cfg["jira_base_url"] = input(f"  Jira base URL [{cfg['jira_base_url']}]: ").strip() or cfg["jira_base_url"]
+    cfg["jira_project"] = input(f"  Jira project [{cfg['jira_project']}]: ").strip() or cfg["jira_project"]
+    cfg["weather_zip"] = input(f"  Weather zip code [{cfg['weather_zip']}]: ").strip() or cfg["weather_zip"]
+
+    available = list(BUILTIN_THEMES.keys())
+    for tf in THEMES_DIR.glob("*.json"):
+        available.append(tf.stem)
+    theme_list = ", ".join(sorted(set(available)))
+    cfg["theme"] = input(f"  Theme ({theme_list}) [{cfg['theme']}]: ").strip() or cfg["theme"]
+
+    save_config(cfg)
+    print(f"\n  Config saved to {CONFIG_FILE}")
+    print(f"  Themes dir: {THEMES_DIR}")
+
+
+# ── Themes ────────────────────────────────────────────────────────────────────
+
+BUILTIN_THEMES = {
+    "yahoo": {
+        "gold": "#ffd700",
+        "border": "#6440a0",
+        "issues": "#64dceb",
+        "reviews": "#64f096",
+        "jira": "#ffc33c",
+        "prs": "#ff9180",
+        "section_title": "bold #be8cff",
+        "meta": "#8c82a0",
+        "detail": "#b0a8c8",
+        "weather_current": "bold #ffe150",
+        "weather_hilo": "#e0dcf0",
+        "weather_forecast": "#b4aae6",
+    },
+    "ocean": {
+        "gold": "#e0f0ff",
+        "border": "#1a5276",
+        "issues": "#5dade2",
+        "reviews": "#48c9b0",
+        "jira": "#f4d03f",
+        "prs": "#eb984e",
+        "section_title": "bold #85c1e9",
+        "meta": "#7f8c8d",
+        "detail": "#aab7b8",
+        "weather_current": "bold #f9e79f",
+        "weather_hilo": "#d5f5e3",
+        "weather_forecast": "#aed6f1",
+    },
+    "mono": {
+        "gold": "#ffffff",
+        "border": "#555555",
+        "issues": "#cccccc",
+        "reviews": "#cccccc",
+        "jira": "#cccccc",
+        "prs": "#cccccc",
+        "section_title": "bold #dddddd",
+        "meta": "#888888",
+        "detail": "#aaaaaa",
+        "weather_current": "bold #ffffff",
+        "weather_hilo": "#cccccc",
+        "weather_forecast": "#aaaaaa",
+    },
+    "dracula": {
+        "gold": "#f8f8f2",
+        "border": "#6272a4",
+        "issues": "#8be9fd",
+        "reviews": "#50fa7b",
+        "jira": "#f1fa8c",
+        "prs": "#ff79c6",
+        "section_title": "bold #bd93f9",
+        "meta": "#6272a4",
+        "detail": "#8a93b0",
+        "weather_current": "bold #f1fa8c",
+        "weather_hilo": "#d6deeb",
+        "weather_forecast": "#bd93f9",
+    },
+    "nord": {
+        "gold": "#eceff4",
+        "border": "#4c566a",
+        "issues": "#88c0d0",
+        "reviews": "#a3be8c",
+        "jira": "#ebcb8b",
+        "prs": "#d08770",
+        "section_title": "bold #81a1c1",
+        "meta": "#616e88",
+        "detail": "#8490a8",
+        "weather_current": "bold #ebcb8b",
+        "weather_hilo": "#d8dee9",
+        "weather_forecast": "#81a1c1",
+    },
+    "solarized": {
+        "gold": "#fdf6e3",
+        "border": "#586e75",
+        "issues": "#2aa198",
+        "reviews": "#859900",
+        "jira": "#b58900",
+        "prs": "#cb4b16",
+        "section_title": "bold #268bd2",
+        "meta": "#657b83",
+        "detail": "#839496",
+        "weather_current": "bold #b58900",
+        "weather_hilo": "#eee8d5",
+        "weather_forecast": "#268bd2",
+    },
+}
+
+
+def load_theme(name: str) -> dict:
+    custom_file = THEMES_DIR / f"{name}.json"
+    if custom_file.exists():
+        try:
+            with open(custom_file) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if name in BUILTIN_THEMES:
+        return BUILTIN_THEMES[name]
+
+    return BUILTIN_THEMES["yahoo"]
+
+
+# Module-level theme (set in main)
+T: dict = BUILTIN_THEMES["yahoo"]
+
+# ── Weather Icons ─────────────────────────────────────────────────────────────
+
+WEATHER_ICONS = {
+    "sunny": ("☀️", "bold #ffe150"),
+    "clear": ("☀️", "bold #ffe150"),
+    "partly cloudy": ("🌤️", "#f0d070"),
+    "partly sunny": ("🌤️", "#f0d070"),
+    "cloudy": ("🌥️", "#b0b0b0"),
+    "overcast": ("☁️", "#909090"),
+    "light rain": ("🌧️", "#82b4ff"),
+    "light drizzle": ("🌧️", "#82b4ff"),
+    "patchy rain possible": ("🌧️", "#82b4ff"),
+    "patchy rain nearby": ("🌧️", "#82b4ff"),
+    "light rain shower": ("🌧️", "#82b4ff"),
+    "rain": ("🌧️", "#5a96ff"),
+    "moderate rain": ("🌧️", "#5a96ff"),
+    "heavy rain": ("🌧️", "#3c78e6"),
+    "showers": ("🌧️", "#5a96ff"),
+    "moderate or heavy rain shower": ("🌧️", "#3c78e6"),
+    "thunderstorm": ("⛈️", "#ff6432"),
+    "thundery outbreaks possible": ("⛈️", "#ff8c50"),
+    "patchy light rain with thunder": ("⛈️", "#ff8c50"),
+    "snow": ("❄️", "#c8e6ff"),
+    "light snow": ("❄️", "#c8e6ff"),
+    "heavy snow": ("❄️", "#a0c8f0"),
+    "blizzard": ("❄️", "#a0c8f0"),
+    "patchy snow possible": ("❄️", "#c8e6ff"),
+    "fog": ("🌫️", "#a0a0a0"),
+    "mist": ("🌫️", "#a0a0a0"),
+    "haze": ("🌫️", "#a0a0a0"),
+    "freezing fog": ("🌫️", "#8c8c8c"),
+    "windy": ("💨", "#b0c8e0"),
+}
+
+
+def weather_icon(condition: str) -> tuple[str, str]:
+    """Returns (icon_char, color_style) for a weather condition."""
+    key = condition.lower().strip()
+    if key in WEATHER_ICONS:
+        return WEATHER_ICONS[key]
+    for k, v in WEATHER_ICONS.items():
+        if k in key or key in k:
+            return v
+    return ("○", "#b0b0b0")
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def fmt_age(iso_str: str) -> str:
+    """Convert ISO timestamp to human-readable age like 1h, 3d, 1w, 2mo."""
+    if not iso_str:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        delta = datetime.now(timezone.utc) - dt
+        mins = int(delta.total_seconds() / 60)
+        if mins < 60:
+            return f"{mins}m"
+        hours = mins // 60
+        if hours < 24:
+            return f"{hours}h"
+        days = hours // 24
+        if days < 7:
+            return f"{days}d"
+        weeks = days // 7
+        if weeks < 5:
+            return f"{weeks}w"
+        months = days // 30
+        if months < 12:
+            return f"{months}mo"
+        return f"{days // 365}y"
+    except (ValueError, TypeError):
+        return "?"
+
+
+def api_get(url: str, headers: dict | None = None, auth: tuple | None = None, timeout: int = 10) -> dict | list | None:
+    try:
+        resp = requests.get(url, headers=headers, auth=auth, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return None
+
+
+# ── Data Fetching ─────────────────────────────────────────────────────────────
+
+def fetch_github_issues(cfg: dict) -> list[dict]:
+    token = cfg["github_token"]
+    user = cfg["github_user"]
+    if not token or not user:
+        return []
+
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+    all_issues = []
+
+    for repo in cfg["github_repos"]:
+        url = f"https://api.github.com/search/issues?q=assignee:{user}+is:issue+is:open+repo:{repo}&per_page=100"
+        data = api_get(url, headers=headers)
+        if not data or "items" not in data:
+            continue
+        for it in data["items"]:
+            labels = [l["name"] for l in it.get("labels", [])]
+            first_label = labels[0] if labels else None
+            all_issues.append({
+                "title": it["title"],
+                "number": it["number"],
+                "url": it["html_url"],
+                "age": fmt_age(it.get("created_at", "")),
+                "comments": it.get("comments", 0),
+                "label": first_label,
+                "repo": repo.split("/")[-1],
+            })
+    return all_issues
+
+
+def fetch_reviews(cfg: dict) -> list[dict]:
+    token = cfg["github_token"]
+    user = cfg["github_user"]
+    if not token or not user:
+        return []
+
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+    all_reviews = []
+
+    for repo in cfg["github_repos"]:
+        url = f"https://api.github.com/search/issues?q=review-requested:{user}+is:pr+is:open+repo:{repo}&per_page=100"
+        data = api_get(url, headers=headers)
+        if not data or "items" not in data:
+            continue
+        for it in data["items"]:
+            status = "⏳ pending"
+            status_color = "#dcbe3c"
+            if it.get("draft"):
+                status = "~ draft"
+                status_color = "#968cc8"
+            all_reviews.append({
+                "title": it["title"],
+                "number": it["number"],
+                "url": it["html_url"],
+                "age": fmt_age(it.get("created_at", "")),
+                "status": status,
+                "status_color": status_color,
+                "repo": repo,
+            })
+    return all_reviews
+
+
+def fetch_my_prs(cfg: dict) -> list[dict]:
+    token = cfg["github_token"]
+    user = cfg["github_user"]
+    if not token or not user:
+        return []
+
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+    all_prs = []
+
+    for repo in cfg["github_repos"]:
+        url = f"https://api.github.com/search/issues?q=author:{user}+is:pr+is:open+repo:{repo}&per_page=100"
+        data = api_get(url, headers=headers)
+        if not data or "items" not in data:
+            continue
+
+        for it in data["items"]:
+            pr_detail = api_get(it["pull_request"]["url"], headers=headers)
+
+            status = "⏳ awaiting review"
+            status_color = "#dcbe3c"
+            if it.get("draft") or (pr_detail and pr_detail.get("draft")):
+                status = "~ draft"
+                status_color = "#968cc8"
+            elif pr_detail and pr_detail.get("mergeable_state") == "dirty":
+                status = "⚡ merge conflict"
+                status_color = "#ff6432"
+            elif pr_detail and pr_detail.get("mergeable_state") == "unstable":
+                status = "⚠ CI failing"
+                status_color = "#ff6432"
+
+            all_prs.append({
+                "title": it["title"],
+                "number": it["number"],
+                "url": it["html_url"],
+                "age": fmt_age(it.get("created_at", "")),
+                "status": status,
+                "status_color": status_color,
+                "repo": repo,
+            })
+    return all_prs
+
+
+def fetch_jira(cfg: dict) -> dict:
+    """Returns {"tickets": [...], "total": N} where total is all unresolved assigned."""
+    email = cfg["jira_email"]
+    pat_path = os.path.expanduser(cfg["jira_pat_path"])
+    base_url = cfg["jira_base_url"]
+    if not email or not os.path.exists(pat_path):
+        return {"tickets": [], "total": 0}
+
+    try:
+        pat = open(pat_path).read().strip()
+    except OSError:
+        return {"tickets": [], "total": 0}
+
+    jql = "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC"
+    fields = "key,summary,status,priority,updated"
+    url = f"{base_url}/rest/api/3/search/jql?jql={requests.utils.quote(jql)}&maxResults=100&fields={fields}"
+
+    data = api_get(url, auth=(email, pat))
+    if not data or "issues" not in data:
+        return {"tickets": [], "total": 0}
+
+    total = data.get("total", len(data["issues"]))
+    tickets = []
+    for issue in data["issues"]:
+        f = issue["fields"]
+        tickets.append({
+            "key": issue["key"],
+            "summary": f.get("summary", ""),
+            "status": (f.get("status") or {}).get("name", ""),
+            "priority": (f.get("priority") or {}).get("name", ""),
+            "age": fmt_age(f.get("updated", "")),
+            "url": f"{base_url}/browse/{issue['key']}",
+        })
+    return {"tickets": tickets, "total": total}
+
+
+JIRA_STATUS_COLORS = {
+    "In Progress": "#82a0ff",
+    "In Review": "#64dc78",
+    "Open": "#ffe03c",
+    "To Do": "#ffe03c",
+    "Done": "#50c878",
+    "Closed": "#888888",
+}
+
+JIRA_PRIORITY_COLORS = {
+    "Critical": "red",
+    "Blocker": "red",
+    "Major": "#ffa032",
+    "Minor": "#8c82a0",
+    "Trivial": "#8c82a0",
+}
+
+LABEL_COLORS = {
+    "bug": "red",
+    "enhancement": "#5a9aff",
+    "feature": "#5a9aff",
+    "documentation": "#b4aae6",
+    "good first issue": "#50c878",
+    "help wanted": "#50c878",
+    "performance": "#ffa032",
+    "security": "#ff6432",
+}
+
+
+US_STATE_ABBREV = {
+    "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR",
+    "California": "CA", "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE",
+    "Florida": "FL", "Georgia": "GA", "Hawaii": "HI", "Idaho": "ID",
+    "Illinois": "IL", "Indiana": "IN", "Iowa": "IA", "Kansas": "KS",
+    "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
+    "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS",
+    "Missouri": "MO", "Montana": "MT", "Nebraska": "NE", "Nevada": "NV",
+    "New Hampshire": "NH", "New Jersey": "NJ", "New Mexico": "NM", "New York": "NY",
+    "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH", "Oklahoma": "OK",
+    "Oregon": "OR", "Pennsylvania": "PA", "Rhode Island": "RI", "South Carolina": "SC",
+    "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX", "Utah": "UT",
+    "Vermont": "VT", "Virginia": "VA", "Washington": "WA", "West Virginia": "WV",
+    "Wisconsin": "WI", "Wyoming": "WY", "District of Columbia": "DC",
+}
+
+
+def _abbrev_state(region: str) -> str:
+    return US_STATE_ABBREV.get(region, region)
+
+
+def fetch_weather(cfg: dict) -> dict | None:
+    zip_code = cfg.get("weather_zip", "95123")
+    data = api_get(f"https://wttr.in/{zip_code}?format=j1")
+    if not data:
+        return None
+
+    try:
+        current = data["current_condition"][0]
+        nearest = data.get("nearest_area", [{}])[0]
+        city = nearest.get("areaName", [{}])[0].get("value", zip_code)
+        region = nearest.get("region", [{}])[0].get("value", "")
+        location = f"{city}, {_abbrev_state(region)}" if region else city
+
+        result = {
+            "location": location,
+            "temp_f": current.get("temp_F", "?"),
+            "condition": current.get("weatherDesc", [{}])[0].get("value", "Unknown"),
+            "high_f": "?",
+            "low_f": "?",
+            "forecast": [],
+        }
+
+        today = data.get("weather", [{}])[0]
+        result["high_f"] = today.get("maxtempF", "?")
+        result["low_f"] = today.get("mintempF", "?")
+
+        days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        for w in data.get("weather", [])[1:4]:
+            date_str = w.get("date", "")
+            try:
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
+                day_name = days[dt.weekday() + 1] if dt.weekday() < 6 else days[0]
+            except ValueError:
+                day_name = date_str
+            cond = w.get("hourly", [{}])[4].get("weatherDesc", [{}])[0].get("value", "?") if len(w.get("hourly", [])) > 4 else "?"
+            result["forecast"].append({
+                "day": day_name,
+                "high_f": w.get("maxtempF", "?"),
+                "low_f": w.get("mintempF", "?"),
+                "condition": cond,
+            })
+
+        return result
+    except (KeyError, IndexError):
+        return None
+
+
+# ── Rendering ─────────────────────────────────────────────────────────────────
+
+def item(color: str, title: str, url: str) -> Text:
+    t = Text(" ○ ", style=color)
+    lt = Text(title, style=color)
+    lt.stylize(f"link {url}")
+    t.append_text(lt)
+    return t
+
+
+def meta_line(*parts: tuple[str, str]) -> Text:
+    t = Text("   ")
+    for text, style in parts:
+        t.append(text, style=style)
+    return t
+
+
+def sect_title(icon: str, name: str, detail: str) -> str:
+    return f"[{T['section_title']}]{icon} {name}[/] [{T['detail']}]· {detail}[/]"
+
+
+def build_header() -> Text:
+    now = datetime.now()
+    day_name = now.strftime("%A")
+    date_str = now.strftime("%b %-d")
+    time_str = now.strftime("%-H:%M")
+
+    title = Text(justify="left")
+    title.append(" ◈", style=f"bold {T['gold']} on {T['border']}")
+    title.append("  HUD", style=f"bold {T['gold']} on {T['border']}")
+    title.append(f"  ─  {day_name} {date_str}  {time_str}", style=f"{T['gold']} on {T['border']}")
+    title.pad_right(300)
+    title.stylize(f"on {T['border']}")
+    return title
+
+
+def build_issues_panel(issues: list[dict]) -> Panel:
+    t = Table.grid(padding=0)
+    t.add_column(no_wrap=True, overflow="ellipsis")
+
+    if not issues:
+        t.add_row(Text("   No assigned issues", style=T["meta"]))
+    else:
+        for iss in issues:
+            t.add_row(item(T["issues"], iss["title"], iss["url"]))
+            parts = [(f"#{iss['number']} · {iss['age']}", T["meta"])]
+            if iss.get("label"):
+                lbl = iss["label"]
+                lbl_color = LABEL_COLORS.get(lbl, "#b4aae6")
+                parts.append((" · ", T["meta"]))
+                parts.append((lbl, lbl_color))
+            if iss.get("comments", 0) > 0:
+                parts.append((f" · {iss['comments']} cmts", T["meta"]))
+            t.add_row(meta_line(*parts))
+
+    repo_name = issues[0]["repo"] if issues else "trafficserver"
+    return Panel(
+        t,
+        title=sect_title("◆", "Issues", f"{repo_name} ({len(issues)})"),
+        title_align="left",
+        border_style=T["border"],
+        padding=(0, 1),
+    )
+
+
+def build_jira_panel(jira_data: dict) -> Panel:
+    tickets = jira_data.get("tickets", [])
+    total = jira_data.get("total", len(tickets))
+
+    t = Table.grid(padding=0)
+    t.add_column(no_wrap=True, overflow="ellipsis")
+
+    if not tickets:
+        t.add_row(Text("   No Jira tickets", style=T["meta"]))
+    else:
+        for tk in tickets:
+            t.add_row(item(T["jira"], tk["summary"], tk["url"]))
+            st_color = JIRA_STATUS_COLORS.get(tk["status"], T["meta"])
+            pr_color = JIRA_PRIORITY_COLORS.get(tk["priority"], T["meta"])
+            parts: list[tuple[str, str]] = [
+                (f"{tk['key']} · ", T["meta"]),
+                (tk["status"], st_color),
+            ]
+            if tk["priority"]:
+                parts.append((" · ", T["meta"]))
+                parts.append((tk["priority"], pr_color))
+            parts.append((f" · {tk['age']}", T["meta"]))
+            t.add_row(meta_line(*parts))
+
+    detail = f"YTSATS ({total})" if total == len(tickets) else f"YTSATS ({len(tickets)}/{total})"
+    return Panel(
+        t,
+        title=sect_title("◆", "Jira", detail),
+        title_align="left",
+        border_style=T["border"],
+        padding=(0, 1),
+    )
+
+
+def _weather_line(prefix: str, icon: str, icon_color: str, suffix: str, style: str) -> Text:
+    """Build a weather line with a colored emoji icon (2 cells wide)."""
+    for ch in icon:
+        set_cell_size(ch, 2)
+    line = Text(prefix, style=style)
+    line.append(icon, style=icon_color)
+    line.append(suffix, style=style)
+    return line
+
+
+def build_weather_panel(weather: dict | None) -> Panel:
+    t = Table.grid(padding=0)
+    t.add_column()
+
+    if not weather:
+        t.add_row(Text(""))
+        t.add_row(Text("   Weather unavailable", style=T["meta"]))
+        location = "Unknown"
+    else:
+        location = weather["location"]
+        icon, icon_color = weather_icon(weather["condition"])
+        t.add_row(_weather_line(
+            " ", icon, icon_color, f"  {weather['temp_f']}°F  {weather['condition']}", T["weather_current"]))
+        t.add_row(Text(f" H: {weather['high_f']}°F  L: {weather['low_f']}°F", style=T["weather_hilo"]))
+        for fc in weather.get("forecast", []):
+            fc_icon, fc_color = weather_icon(fc["condition"])
+            t.add_row(_weather_line(
+                f" {fc['day']}  ", fc_icon, fc_color, f"  {fc['high_f']}°/{fc['low_f']}°F  {fc['condition']}", T["weather_forecast"]))
+
+    return Panel(
+        t,
+        title=sect_title("◆", "Weather", location),
+        title_align="left",
+        border_style=T["border"],
+        padding=(0, 1),
+    )
+
+
+def build_reviews_panel(reviews: list[dict]) -> Panel:
+    t = Table.grid(padding=0)
+    t.add_column(no_wrap=True, overflow="ellipsis")
+
+    if not reviews:
+        t.add_row(Text("   No reviews requested", style=T["meta"]))
+    else:
+        for rv in reviews:
+            t.add_row(item(T["reviews"], rv["title"], rv["url"]))
+            t.add_row(meta_line(
+                (f"#{rv['number']} · {rv['age']} · ", T["meta"]),
+                (rv["status"], rv["status_color"]),
+            ))
+
+    repo_display = reviews[0]["repo"].split("/")[-1] if reviews else "trafficserver"
+    return Panel(
+        t,
+        title=sect_title("◆", "Reviews", f"{repo_display} ({len(reviews)})"),
+        title_align="left",
+        border_style=T["border"],
+        padding=(0, 1),
+    )
+
+
+def build_prs_panel(prs: list[dict]) -> Panel:
+    t = Table.grid(padding=0)
+    t.add_column(no_wrap=True, overflow="ellipsis")
+
+    if not prs:
+        t.add_row(Text("   No open PRs", style=T["meta"]))
+    else:
+        for pr in prs:
+            t.add_row(item(T["prs"], pr["title"], pr["url"]))
+            t.add_row(meta_line(
+                (f"#{pr['number']} · {pr['age']} · ", T["meta"]),
+                (pr["status"], pr["status_color"]),
+            ))
+
+    repo_display = prs[0]["repo"].split("/")[-1] if prs else "trafficserver"
+    return Panel(
+        t,
+        title=sect_title("◆", "My PRs", f"{repo_display} ({len(prs)})"),
+        title_align="left",
+        border_style=T["border"],
+        padding=(0, 1),
+    )
+
+
+# ── Cache ─────────────────────────────────────────────────────────────────────
+
+def load_cache() -> dict | None:
+    if CACHE_FILE.exists():
+        try:
+            with open(CACHE_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
+
+
+def save_cache(data: dict):
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CACHE_FILE, "w") as f:
+        json.dump(data, f)
+
+
+FETCH_STEPS = [
+    ("GitHub issues", "issues", fetch_github_issues),
+    ("GitHub reviews", "reviews", fetch_reviews),
+    ("GitHub PRs", "prs", fetch_my_prs),
+    ("Jira tickets", "jira", fetch_jira),
+    ("Weather", "weather", fetch_weather),
+]
+
+
+def fetch_all(cfg: dict, console: Console | None = None) -> dict:
+    """Fetch all data sources. Shows a spinner if console is provided."""
+    data: dict = {}
+    if console:
+        from rich.status import Status
+        with Status("", console=console, spinner="dots") as status:
+            for label, key, fn in FETCH_STEPS:
+                status.update(f"[{T['detail']}]Fetching {label}...[/]")
+                data[key] = fn(cfg)
+    else:
+        for _, key, fn in FETCH_STEPS:
+            data[key] = fn(cfg)
+    data["fetched_at"] = time.time()
+    return data
+
+
+# ── Layout Builder ────────────────────────────────────────────────────────────
+
+def build_layout(data: dict) -> Layout:
+    issues = data.get("issues", [])
+    reviews = data.get("reviews", [])
+    prs = data.get("prs", [])
+    jira_data = data.get("jira", {"tickets": [], "total": 0})
+    weather = data.get("weather")
+
+    weather_rows = 4 + len(weather.get("forecast", [])) if weather else 4
+
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=1),
+        Layout(name="body"),
+    )
+    layout["body"].split_row(
+        Layout(name="sidebar", ratio=2),
+        Layout(name="main", ratio=3),
+    )
+    layout["sidebar"].split_column(
+        Layout(name="issues", ratio=1),
+        Layout(name="jira", ratio=1),
+        Layout(name="weather", size=weather_rows),
+    )
+    MAX_FIXED = 14
+    reviews_rows = max(len(reviews), 1) * 2 + 2
+    if reviews_rows <= MAX_FIXED:
+        layout["main"].split_column(
+            Layout(name="reviews", size=reviews_rows),
+            Layout(name="prs"),
+        )
+    else:
+        layout["main"].split_column(
+            Layout(name="reviews", ratio=1),
+            Layout(name="prs", ratio=1),
+        )
+
+    layout["header"].update(build_header())
+    layout["issues"].update(build_issues_panel(issues))
+    layout["jira"].update(build_jira_panel(jira_data))
+    layout["weather"].update(build_weather_panel(weather))
+    layout["reviews"].update(build_reviews_panel(reviews))
+    layout["prs"].update(build_prs_panel(prs))
+
+    return layout
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="HUD - Heads-Up Display for your workday")
+    parser.add_argument("--setup", action="store_true", help="Run interactive setup")
+    parser.add_argument("--refresh", type=int, default=60, metavar="SECS",
+                        help="Auto-refresh interval in seconds (default: 60, 0 = run once)")
+    parser.add_argument("--theme", type=str, default=None, metavar="NAME",
+                        help="Override theme (yahoo, ocean, mono, or custom)")
+    args = parser.parse_args()
+
+    if args.setup:
+        run_setup()
+        return
+
+    cfg = load_config()
+
+    if not cfg["github_token"]:
+        print("No config found. Run: uv run hud --setup")
+        sys.exit(1)
+
+    global T
+    theme_name = args.theme or cfg.get("theme", "yahoo")
+    T = load_theme(theme_name)
+
+    refresh_secs = args.refresh
+    console = Console()
+    cached = load_cache()
+
+    if refresh_secs <= 0:
+        if cached:
+            console.print(build_layout(cached))
+            data = fetch_all(cfg)
+        else:
+            data = fetch_all(cfg, console=console)
+            console.print(build_layout(data))
+        save_cache(data)
+        return
+
+    if cached:
+        initial = cached
+    else:
+        initial = fetch_all(cfg, console=console)
+        save_cache(initial)
+
+    try:
+        with Live(build_layout(initial), console=console, screen=False, refresh_per_second=1) as live:
+            if cached:
+                data = fetch_all(cfg)
+                save_cache(data)
+                live.update(build_layout(data))
+            while True:
+                time.sleep(refresh_secs)
+                data = fetch_all(cfg)
+                save_cache(data)
+                live.update(build_layout(data))
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
