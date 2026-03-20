@@ -2,7 +2,7 @@
 
 A terminal dashboard that shows everything on your radar: GitHub PRs, issues, Jira tickets, and local weather. One glance, no context switching.
 
-![HUD screenshot](https://raw.githubusercontent.com/bryancall/hud/main/screenshot.png)
+![HUD screenshot](https://raw.githubusercontent.com/bryancall/hud/main/screenshot.png?v=2)
 
 ## Features
 
